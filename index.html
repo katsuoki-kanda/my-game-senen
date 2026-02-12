@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>千円くずし - Face Mesh 安定版</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    
+    <style>
+        body {
+            background-color: #000;
+            margin: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            overflow: hidden;
+            color: white;
+            font-family: 'Hiragino Kaku Gothic ProN', 'Meiryo', sans-serif;
+        }
+        #game-container {
+            position: relative;
+            width: 90vw;
+            max-width: 1600px;
+            aspect-ratio: 1600 / 850;
+            border: 2px solid #333;
+            background: #000;
+        }
+        canvas {
+            width: 100%;
+            height: 100%;
+            display: block;
+            position: relative;
+            z-index: 2;
+        }
+        #input_video {
+            display: none;
+        }
+        #overlay {
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.85);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 10;
+            text-align: center;
+        }
+        h1 { font-size: 4rem; margin-bottom: 20px; color: #fff; }
+        #load-progress { font-size: 1.8rem; color: #ffeb3b; line-height: 1.6; }
+    </style>
+</head>
+<body>
+
+<div id="game-container">
+    <video id="input_video" autoplay playsinline></video>
+    <canvas id="gameCanvas" width="1600" height="850"></canvas>
+    <div id="overlay">
+        <h1 id="status-text">システム起動中...</h1>
+        <div id="load-progress">Loading Face Mesh Model...</div>
+    </div>
+</div>
+
+<script>
+/**
+ * 定数・設定
+ */
+const SCREEN_WIDTH = 1600;
+const SCREEN_HEIGHT = 850;
+const GAME_DURATION = 60; 
+const BALL_SPEED_BASE = 400;   
+
+const canvas = document.getElementById("gameCanvas");
+const ctx = canvas.getContext("2d");
+const overlay = document.getElementById("overlay");
+const statusText = document.getElementById("status-text");
+const loadProgress = document.getElementById("load-progress");
+const videoElement = document.getElementById('input_video');
+
+const assets = {
+    images: { paddle: '1.png', block: '2.png', ball: '3.png' },
+    sounds: { block: '1.wav', paddle: '2.wav', gameover: '3.wav' }
+};
+
+let imgRes = {}, sndRes = {};
+let loadedCount = 0;
+const totalCount = 6; 
+
+let score = 0;
+let startTime;
+let lastFrameTime = 0;
+let launchLockUntil = 0;
+let restartEnableTime = 0; // 再スタートを許可する時刻
+let gameActive = false;
+let ballActive = false;
+let timeLeft = GAME_DURATION;
+let blocks = [];
+
+// 顔操作
+let baseNoseX = null; 
+let currentNoseX = 0.5;
+let isMouthOpen = false;
+let areEyebrowsRaised = false;
+
+function speak(text) {
+    const uttr = new SpeechSynthesisUtterance(text);
+    uttr.lang = "ja-JP";
+    window.speechSynthesis.speak(uttr);
+}
+
+const faceMesh = new FaceMesh({
+  locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`
+});
+
+faceMesh.setOptions({
+  maxNumFaces: 1,
+  refineLandmarks: true,
+  minDetectionConfidence: 0.5,
+  minTrackingConfidence: 0.5
+});
+
+faceMesh.onResults(onResults);
+
+function onResults(results) {
+    if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
+        const landmarks = results.multiFaceLandmarks[0];
+
+        // 鼻位置
+        const nose = landmarks[4];
+        if (baseNoseX === null) baseNoseX = nose.x;
+        currentNoseX = nose.x;
+
+        // 口の開閉 (感度0.025)
+        const mouthTop = landmarks[13];
+        const mouthBottom = landmarks[14];
+        const mouthDist = Math.abs(mouthBottom.y - mouthTop.y);
+        isMouthOpen = mouthDist > 0.025; 
+
+        // 眉毛の上がり (感度0.033)
+        const eyebrow = landmarks[105];
+        const eye = landmarks[159];
+        const browDist = Math.abs(eye.y - eyebrow.y);
+        areEyebrowsRaised = browDist > 0.05; 
+
+        // 再開処理（クールダウン経過後のみ許可）
+        if (areEyebrowsRaised && !gameActive && Date.now() > restartEnableTime) {
+            startGame();
+        }
+    }
+}
+
+const camera = new Camera(videoElement, {
+  onFrame: async () => {
+    await faceMesh.send({image: videoElement});
+  },
+  width: 640, height: 480
+});
+
+function loadResources() {
+    for (let key in assets.images) {
+        const img = new Image();
+        img.onload = checkLoad;
+        img.src = assets.images[key];
+        imgRes[key] = img;
+    }
+    for (let key in assets.sounds) {
+        const audio = new Audio();
+        audio.oncanplaythrough = checkLoad;
+        audio.src = assets.sounds[key];
+        sndRes[key] = audio;
+    }
+}
+
+function checkLoad() {
+    loadedCount++;
+    if (loadedCount >= totalCount) {
+        camera.start().then(() => {
+            statusText.innerText = "READY";
+            loadProgress.innerHTML = "眉毛を上げるとスタート！<br>(上げた時の鼻の位置が中央になります)";
+        });
+    }
+}
+
+function playSnd(name) {
+    if (sndRes[name]) {
+        sndRes[name].currentTime = 0;
+        sndRes[name].play().catch(() => {});
+    }
+}
+
+const paddle = {
+    w: 0, h: 0, x: 0, y: 0,
+    init() {
+        this.w = imgRes.paddle.width;
+        this.h = imgRes.paddle.height;
+        this.x = (SCREEN_WIDTH - this.w) / 2;
+        this.y = SCREEN_HEIGHT - this.h - 10;
+    },
+    update() {
+        if (baseNoseX !== null) {
+            let sensitivity = 2.0;
+            let diff = (currentNoseX - baseNoseX) * sensitivity;
+            let targetX = (0.5 - diff) * SCREEN_WIDTH - (this.w / 2);
+            this.x = Math.max(0, Math.min(SCREEN_WIDTH - this.w, targetX));
+        }
+    },
+    draw() { ctx.drawImage(imgRes.paddle, this.x, this.y); }
+};
+
+const ball = {
+    w: 0, h: 0, x: 0, y: 0, dx: 0, dy: 0,
+    init() {
+        this.w = imgRes.ball.width;
+        this.h = imgRes.ball.height;
+        this.reset();
+    },
+    reset() {
+        ballActive = false;
+        this.x = paddle.x + (paddle.w - this.w) / 2;
+        this.y = paddle.y - this.h;
+        this.dx = 0; this.dy = 0;
+    },
+    update(dt) {
+        if (!ballActive) {
+            this.x = paddle.x + (paddle.w - this.w) / 2;
+            this.y = paddle.y - this.h;
+            if (isMouthOpen && Date.now() > launchLockUntil) {
+                ballActive = true;
+                this.dy = -BALL_SPEED_BASE;
+                playSnd("gameover");
+            }
+            return;
+        }
+
+        this.x += this.dx * dt;
+        this.y += this.dy * dt;
+
+        if (this.x < 0) { this.x = 0; this.dx *= -1; playSnd("paddle"); }
+        if (this.x + this.w > SCREEN_WIDTH) { this.x = SCREEN_WIDTH - this.w; this.dx *= -1; playSnd("paddle"); }
+        if (this.y < 0) { this.y = 0; this.dy *= -1; playSnd("paddle"); }
+
+        if (this.dy > 0 && this.y + this.h > paddle.y && this.x + this.w > paddle.x && this.x < paddle.x + paddle.w) {
+            let ratio = (this.x - (paddle.x - this.w)) / (paddle.w + this.w);
+            let angle = 145 - ratio * 110;
+            let rad = angle * Math.PI / 180;
+            this.dx = BALL_SPEED_BASE * Math.cos(rad);
+            this.dy = -BALL_SPEED_BASE * Math.sin(rad);
+            playSnd("paddle");
+        }
+
+        if (this.y > SCREEN_HEIGHT) {
+            score -= 10000;
+            playSnd("gameover");
+            speak("罰金1万円");
+            this.reset();
+        }
+
+        for(let i=0; i<blocks.length; i++) {
+            let b = blocks[i];
+            if (!b.alive) continue;
+            if (this.x < b.x + b.w && this.x + this.w > b.x && this.y < b.y + b.h && this.y + this.h > b.y) {
+                b.alive = false;
+                this.dy *= -1;
+                playSnd("block");
+                score += 1000;
+                break; 
+            }
+        }
+    },
+    draw() { ctx.drawImage(imgRes.ball, this.x, this.y); }
+};
+
+function initBlocks() {
+    blocks = [];
+    const bW = imgRes.block.width, bH = imgRes.block.height;
+    for (let x = 1; x <= 14; x++) {
+        for (let y = 1; y <= 10; y++) {
+            blocks.push({ x: x * bW, y: y * bH, w: bW, h: bH, alive: true });
+        }
+    }
+}
+
+function startGame() {
+    overlay.style.display = "none";
+    score = 0;
+    gameActive = true;
+    lastFrameTime = performance.now();
+    
+    let now = Date.now();
+    launchLockUntil = now + 2000; 
+    startTime = now + 2000; // カウントダウン後にタイマー開始
+    
+    baseNoseX = null; 
+    paddle.init();
+    ball.init();
+    initBlocks();
+    requestAnimationFrame(loop);
+}
+
+function loop(timestamp) {
+    if (!gameActive) return;
+
+    const dt = (timestamp - lastFrameTime) / 1000;
+    lastFrameTime = timestamp;
+    const effectiveDt = Math.min(dt, 0.1); 
+
+    ctx.clearRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+    
+    let now = Date.now();
+    
+    if (now < launchLockUntil) {
+        timeLeft = GAME_DURATION;
+    } else {
+        timeLeft = Math.max(0, GAME_DURATION - (now - startTime) / 1000);
+    }
+
+    if (timeLeft <= 0) {
+        gameActive = false;
+        drawEnd();
+        return;
+    }
+
+    paddle.update();
+    ball.update(effectiveDt);
+
+    for(let i=0; i<blocks.length; i++) {
+        if (blocks[i].alive) ctx.drawImage(imgRes.block, blocks[i].x, blocks[i].y);
+    }
+    paddle.draw();
+    ball.draw();
+    drawUI(now);
+
+    requestAnimationFrame(loop);
+}
+
+function drawUI(now) {
+    ctx.font = "40px sans-serif";
+    ctx.fillStyle = "white";
+    ctx.fillText("所持金:", 50, 60);
+    ctx.fillStyle = "red";
+    ctx.fillText(`${score}円`, 180, 60);
+    
+    ctx.fillStyle = "#f0f";
+    ctx.textAlign = "right";
+    ctx.fillText(`TIME: ${Math.floor(timeLeft)}`, 1550, 60);
+    ctx.textAlign = "left";
+
+    ctx.font = "100px sans-serif";
+    ctx.textAlign = "center";
+    if (score >= 50000 && score < 55000) { 
+        ctx.fillStyle = "yellow"; ctx.fillText("５万円獲得！", SCREEN_WIDTH/2, 120); 
+    }
+    if (score >= 100000 && score < 105000) { 
+        ctx.fillStyle = "yellow"; ctx.fillText("１０万円獲得！！", SCREEN_WIDTH/2, 120); 
+    }
+    if (score < 0) { 
+        ctx.fillStyle = "red"; ctx.fillText("借金生活です", SCREEN_WIDTH/2, 120); 
+    }
+
+    if (!ballActive && now < launchLockUntil) {
+        let sec = Math.ceil((launchLockUntil - now) / 1000);
+        ctx.font = "bold 150px sans-serif";
+        ctx.fillStyle = "yellow";
+        ctx.fillText(sec, SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2);
+    }
+    ctx.textAlign = "left";
+}
+
+function drawEnd() {
+    // スコア表示を確定させてからオーバーレイを表示
+    statusText.innerText = "終了！";
+    loadProgress.innerHTML = `最終所持金: <span style="color: #ff5252; font-size: 2.5rem;">${score}円</span><br><br><span style="color: #fff; font-size: 1.2rem;">もう一度眉を上げるとリスタート</span>`;
+    overlay.style.display = "flex";
+    
+    // クールダウン設定：2秒間は再入力を無効化
+    restartEnableTime = Date.now() + 2000;
+    
+    speak(`終了です。最終所持金は、${score}円です。`);
+    baseNoseX = null;
+}
+
+loadResources();
+</script>
+</body>
+</html>
